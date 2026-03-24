@@ -647,21 +647,18 @@ where
         }
 
         // Otherwise we have to follow the probe chain:
-        let mut delta = get_first_delta(buckets, index, size_mask).load(Ordering::Relaxed);
+        let mut delta = get_first_delta(buckets, index, size_mask).load(Ordering::Acquire);
         while delta != 0 {
             index = (index + delta as usize) & size_mask;
             let cell = get_cell(buckets, index, size_mask);
             let probe_hash = cell.hash.load(Ordering::Relaxed);
             let probe_key = cell.key.load(Ordering::Relaxed);
 
-            // NOTE: It's possible that a concurrent insert memory reordering
-            //       causes probe_hash to be default, but we don't need to check
-            //       for that case, and we can just follow the probe chain.
             if probe_hash == hash && key.eq(probe_key.borrow()) {
                 return Some(cell);
             }
 
-            delta = get_second_delta(buckets, index, size_mask).load(Ordering::Relaxed);
+            delta = get_second_delta(buckets, index, size_mask).load(Ordering::Acquire);
         }
 
         None
@@ -1088,7 +1085,7 @@ where
         loop {
             let mut follow_link = false;
             let prev_link = get_delta(buckets, index, size_mask, first);
-            let probe_delta = prev_link.load(Ordering::Relaxed);
+            let probe_delta = prev_link.load(Ordering::Acquire);
             first = false;
 
             // Search the probe chain for this cell:
@@ -1096,20 +1093,11 @@ where
                 index += probe_delta as usize;
 
                 let cell = get_cell(buckets, index, size_mask);
-                let mut probe_hash = cell.hash.load(Ordering::Relaxed);
-                if probe_hash == null_hash() {
-                    // The cell has been linked to the probe chain, but the hash
-                    // is not yet visible. We chould change this here to use
-                    // acquire and release, which would guarantee that the change
-                    // is visible, but it's easier to just poll:
-                    // FIXME : Cange this to acquire releaase ...
-                    loop {
-                        probe_hash = cell.hash.load(Ordering::Acquire);
-                        if probe_hash != null_hash() {
-                            break;
-                        }
-                    }
-                }
+                let probe_hash = cell.hash.load(Ordering::Relaxed);
+                debug_assert!(
+                    probe_hash != null_hash(),
+                    "hash must be visible after Acquire-load of delta"
+                );
 
                 // Only hashes in the same bucket can be linked.
                 debug_assert!((probe_hash ^ hash) as usize & size_mask == 0);
@@ -1160,7 +1148,7 @@ where
                             Ok(_) => {
                                 // Now link the cell to the previous cell in the same bucket:
                                 let offset = (index - prev_link_index) as u8;
-                                prev_link.store(offset, Ordering::Relaxed);
+                                prev_link.store(offset, Ordering::Release);
 
                                 // CHECK: No race here with another cell
                                 cell.key.store(*key, Ordering::Relaxed);
@@ -1193,7 +1181,7 @@ where
                         // the link chain is well-formed, and subsequent lookups could
                         // fail.
                         let offset = (index - prev_link_index) as u8;
-                        prev_link.store(offset, Ordering::Relaxed);
+                        prev_link.store(offset, Ordering::Release);
 
                         // Now we need to go back to the start of the loop, and follow
                         // the probe chain from this index, now that the previous
